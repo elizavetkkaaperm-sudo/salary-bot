@@ -60,18 +60,27 @@ def load_csv(gid: int) -> pd.DataFrame:
     return pd.read_csv(url, dtype=str)
 
 
+def safe_str(val) -> str:
+    """Достаёт строку из ячейки DataFrame, корректно обрабатывая NaN."""
+    if val is None:
+        return ""
+    if isinstance(val, float) and pd.isna(val):
+        return ""
+    return str(val).strip()
+
+
 def load_passwords() -> dict[str, dict]:
     """Загружает лист паролей → словарь {пароль: {фио, обращение, отдел}}."""
     df = load_csv(PASSWORDS_GID)
     result = {}
     for _, row in df.iterrows():
-        pwd = str(row.get("Пароль", "")).strip()
+        pwd = safe_str(row.get("Пароль"))
         if not pwd:
             continue
         result[pwd] = {
-            "fio": (row.get("ФИО") or row.get("фио") or "").strip(),
-            "short_name": str(row.get("Обращение", "")).strip(),
-            "department": str(row.get("Отдел", "")).strip(),
+            "fio": safe_str(row.get("ФИО") or row.get("фио")),
+            "short_name": safe_str(row.get("Обращение")),
+            "department": safe_str(row.get("Отдел")),
         }
     logging.info("Загружено %s паролей", len(result))
     return result
@@ -98,9 +107,9 @@ def find_salary(department: str, fio: str, month: int, year: int) -> dict | None
         return None
     df = load_csv(gid)
     for _, row in df.iterrows():
-        if str(row.get("Месяц", "")).strip() == str(month) and \
-           str(row.get("Год", "")).strip() == str(year) and \
-           str(row.get("ФИО", "")).strip() == fio:
+        if safe_str(row.get("Месяц")) == str(month) and \
+           safe_str(row.get("Год")) == str(year) and \
+           safe_str(row.get("ФИО")) == fio:
             return row.to_dict()
     return None
 
