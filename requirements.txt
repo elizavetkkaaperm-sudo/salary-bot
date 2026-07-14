@@ -1,3 +1,0 @@
-python-telegram-bot[webhooks]==21.6
-pandas
-httpx
