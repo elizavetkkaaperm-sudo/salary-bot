@@ -1,7 +1,7 @@
 """
-Telegram-бот для расшифровки зарплат · Коченевских бюро
+Telegram-бот для расшифровки зарплат + агент-комплектатор · Коченевских бюро
 Данные из Google Sheets через CSV. Python-telegram-bot v21+.
-Версия 4 — лист паролей, авто-отдел, выбор года.
+Версия 5 — добавлен AI-агент для отдела комплектации.
 """
 import os
 
@@ -24,13 +24,19 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 import pandas as pd
+import httpx
 
 # ── Настройка ───────────────────────────────────────────────────
-TELEGRAM_TOKEN = "8511200367:AAEPY0SVgMaXUGy6iMDSWR1COy171-GoaWM"
+TELEGRAM_TOKEN = "8511200367:***"
 
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1kTSGJUmb2AOTovaIDtzC6e-EltiZeeOGV6yJr8FWs-Q/export?format=csv&gid={gid}"
 
 PROXY_URL = os.environ.get("BOT_PROXY", "")
+
+# AI API (OpenRouter — для агента-комплектатора)
+AI_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+AI_MODEL = "deepseek/deepseek-chat"  # дешёвая модель, ~$0.14/1M токенов
+AI_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # GID вкладок
 PASSWORDS_GID = 836125341
@@ -53,7 +59,174 @@ PASSWORD, YEAR, MONTH = range(3)
 logging.basicConfig(format="%(asctime)s %(message)s", level=logging.INFO)
 
 
-# ── Загрузка данных ─────────────────────────────────────────────
+# ── Загрузка базы знаний комплектатора ──────────────────────────
+
+def load_knowledge(folder: str = "knowledge") -> str:
+    """Загружает все .md файлы из папки knowledge/ в одну строку."""
+    if not os.path.exists(folder):
+        logging.warning("Папка %s не найдена", folder)
+        return ""
+    parts = []
+    for fname in sorted(os.listdir(folder)):
+        if fname.endswith(".md"):
+            with open(os.path.join(folder, fname), "r", encoding="utf-8") as f:
+                parts.append(f.read())
+    result = "\n\n---\n\n".join(parts)
+    logging.info("База знаний загружена: %s файлов, %s символов", len(parts), len(result))
+    return result
+
+KNOWLEDGE_KOMPLEKTATOR = load_knowledge("knowledge/")
+
+
+# ── Классификатор вопросов ──────────────────────────────────────
+
+KOMPLEKTATOR_KEYWORDS = [
+    "накладная", "упд", "эльба", "счёт поставщика", "счет поставщика",
+    "документооборот", "приемка", "приёмка", "передача товара",
+    "дилерск", "бонус", "поставщик", "чек", "касса",
+    "ккт", "закупочн", "шаблон", "чек-лист", "чек лист",
+    "красный флаг", "комплектаци", "отгрузка",
+    "закрывающий документ", "эдо", "счет-фактура", "счёт-фактура",
+    "сф ", " сф", "дизайнерский", "дилер", "хранение документов",
+    "архив", "брак", "поврежден", "некомплект", "принимающее лицо",
+    "доставка", "ррц", "закупочная цена", "закупочную цену",
+    "агентский", "агентское", "подрядчик", "физлицо", "юрлицо",
+    "контрагент", "реквизит", "офд", "сно", "усн",
+]
+
+SALARY_KEYWORDS = [
+    "зарплата", "оклад", "премия", "сколько заработал",
+    "выплата", "ведомость", "расшифровка", "зп",
+    "к выплате", "мотиваци", "kpi",
+]
+
+
+def classify_question(text: str) -> str:
+    """Возвращает 'komplektator' или 'salary'. По умолчанию — 'komplektator'."""
+    text_lower = text.lower()
+
+    # Явные команды зарплатного флоу
+    if text_lower in ["/start", "start", "/cancel", "cancel"]:
+        return "salary"
+
+    for kw in SALARY_KEYWORDS:
+        if kw in text_lower:
+            # Проверяем, что это не ложное срабатывание
+            # "чек" в контексте комплектации — не про зарплату
+            return "salary"
+
+    for kw in KOMPLEKTATOR_KEYWORDS:
+        if kw in text_lower:
+            return "komplektator"
+
+    # Если ничего не подошло и это не пароль — комплектатор
+    return "komplektator"
+
+
+def is_password(text: str) -> bool:
+    """Проверяет, похоже ли сообщение на пароль (короткое, цифры/буквы)."""
+    t = text.strip()
+    # Пароли обычно короткие
+    if len(t) > 20:
+        return False
+    # Если похоже на вопрос — не пароль
+    if "?" in t or " " in t and len(t.split()) > 3:
+        return False
+    return True
+
+
+# ── AI-агент комплектатора ─────────────────────────────────────
+
+SYSTEM_PROMPT_KOMPLEKTATOR = (
+    "Ты — AI-ассистент отдела комплектации компании «Коченевских бюро».\n"
+    "Твоя задача — помочь комплектаторам с документооборотом, правилами оформления сделок, "
+    "работой в Эльбе, приемкой товара, чеками, поставщиками и шаблонами сообщений.\n\n"
+    "ЖЁСТКИЕ ПРАВИЛА:\n"
+    "1. Отвечай ТОЛЬКО на основе базы знаний ниже. НИКОГДА не додумывай.\n"
+    "2. Если ответа нет в регламенте — честно скажи: «В регламенте этого нет. Уточни у руководителя отдела реализации или МД.»\n"
+    "3. По КРАСНЫМ ФЛАГАМ (нестандартные ситуации) — НИКОГДА не давай самостоятельных решений. "
+    "Напоминай: «Это красный флаг. Передай вопрос руководителю или МД.»\n"
+    "4. Если сотрудник просит шаблон сообщения — дай точный текст из базы. Не перефразируй.\n"
+    "5. Общайся как коллега: спокойно, по делу, без официоза.\n"
+    "6. НИКОГДА не лезь в финансы, зарплаты и бухгалтерию. Это не твоя зона.\n\n"
+    "=== БАЗА ЗНАНИЙ ===\n"
+)
+
+
+async def call_ai(system: str, question: str) -> str:
+    """Отправляет запрос к AI API и возвращает ответ."""
+    if not AI_API_KEY:
+        return (
+            "🤖 Агент-комплектатор пока не подключён к AI API.\n"
+            "Добавь переменную OPENROUTER_API_KEY в настройки Render.\n\n"
+            "А пока — посмотри ответ в регламенте вручную или спроси у руководителя."
+        )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": question},
+    ]
+
+    headers = {
+        "Authorization": f"Bearer {AI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    body = {
+        "model": AI_MODEL,
+        "messages": messages,
+        "max_tokens": 1500,
+        "temperature": 0.3,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(AI_API_URL, json=body, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                answer = data["choices"][0]["message"]["content"]
+                return answer.strip()
+            else:
+                logging.error("AI API error: %s %s", resp.status_code, resp.text[:200])
+                return (
+                    "⚠️ Не смог получить ответ от AI. Попробуй через минуту "
+                    "или спроси у руководителя."
+                )
+    except Exception as e:
+        logging.error("AI API exception: %s", e)
+        return (
+            "⚠️ AI-агент временно недоступен. Попробуй позже "
+            "или посмотри ответ в регламенте."
+        )
+
+
+async def handle_komplektator(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает вопрос к агенту-комплектатору."""
+    question = update.message.text.strip()
+
+    if not KNOWLEDGE_KOMPLEKTATOR:
+        await update.message.reply_text(
+            "📁 База знаний комплектатора не загружена. "
+            "Проверь папку knowledge/ на сервере."
+        )
+        return
+
+    # Показываем что бот думает
+    await update.message.chat.send_action("typing")
+
+    system = SYSTEM_PROMPT_KOMPLEKTATOR + KNOWLEDGE_KOMPLEKTATOR[:60000]
+    answer = await call_ai(system, question)
+
+    # Добавляем подсказку для навигации
+    nav_hint = "\n\n💡 _Это был агент-комплектатор. Хочешь узнать зарплату? Напиши /start_"
+
+    await update.message.reply_text(
+        answer + nav_hint,
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True),
+    )
+
+
+# ── Загрузка данных (существующий код) ──────────────────────────
 
 def load_csv(gid: int) -> pd.DataFrame:
     url = SHEET_URL.format(gid=gid)
@@ -221,10 +394,61 @@ def year_keyboard() -> list[list[str]]:
     return [[str(y) for y in range(now - 2, now + 1)]]
 
 
-# ── Обработчики ─────────────────────────────────────────────────
+# ── Маршрутизатор сообщений (новый!) ────────────────────────────
+
+async def router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    """
+    Перехватывает ВСЕ текстовые сообщения ДО ConversationHandler.
+    Если это вопрос комплектатора и пользователь не в диалоге зарплат —
+    отправляет агенту-комплектатору.
+    Если /start или пароль — отдаёт ConversationHandler.
+    """
+    text = update.message.text.strip() if update.message.text else ""
+
+    # /start всегда запускает зарплатный флоу
+    if text == "/start":
+        return None  # пропускаем в ConversationHandler
+
+    # Если пользователь уже ввёл пароль и находится в диалоге — не трогаем
+    if context.user_data.get("entry"):
+        return None  # пропускаем в ConversationHandler
+
+    # Классифицируем
+    agent = classify_question(text)
+
+    if agent == "salary":
+        # Возможно пароль — отдаём в ConversationHandler
+        if is_password(text):
+            return None  # пропускаем
+        else:
+            # Вопрос про зарплату без пароля — предлагаем /start
+            await update.message.reply_text(
+                "Для просмотра зарплаты нужен пароль 🔑\n"
+                "Напиши /start и введи пароль.",
+                reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True),
+            )
+            return ConversationHandler.END
+
+    # Комплектатор
+    # Но сначала — если похоже на пароль, не отправляем агенту
+    if is_password(text):
+        await update.message.reply_text(
+            "Похоже на пароль 🔑\n"
+            "Напиши /start и введи пароль для просмотра зарплаты.\n\n"
+            "Если у тебя вопрос по документообороту — напиши его словами, и я помогу.",
+            reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True),
+        )
+        return ConversationHandler.END
+
+    await handle_komplektator(update, context)
+    return ConversationHandler.END
+
+
+# ── Обработчики диалога зарплат ─────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logging.info("/start: новый диалог")
+    context.user_data.clear()  # очищаем предыдущий диалог
 
     await update.message.reply_text(
         "Привет! 👋\n\n"
@@ -238,7 +462,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     pwd = update.message.text.strip()
 
-    # Загружаем пароли напрямую, а не из bot_data (надёжнее на вебхуке)
     try:
         passwords = load_passwords()
     except Exception as e:
@@ -412,6 +635,7 @@ async def handle_after_view(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
     await update.message.reply_text(
         "Без проблем! /start — когда понадоблюсь снова 👋",
         reply_markup=ReplyKeyboardMarkup([["/start"]], resize_keyboard=True),
@@ -461,6 +685,13 @@ def main():
         .build()
     )
 
+    # 1. Маршрутизатор: перехватывает ВСЕ сообщения ДО диалога зарплат
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, router),
+        group=0,  # высший приоритет
+    )
+
+    # 2. Диалог зарплат (ConversationHandler)
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
