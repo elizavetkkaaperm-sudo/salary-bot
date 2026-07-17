@@ -111,9 +111,6 @@ def classify_question(text: str) -> str:
     if text_lower in ["/start", "start", "/cancel", "cancel"]:
         return "salary"
 
-    # Похоже на пароль и пользователь ещё не вошёл - отдаём ConversationHandler
-    if is_password(text) and not context.user_data.get("entry"):
-        return None
 
     for kw in SALARY_KEYWORDS:
         if kw in text_lower:
@@ -414,6 +411,10 @@ async def router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | No
     # /start всегда запускает зарплатный флоу
     if text == "/start":
         return None  # пропускаем в ConversationHandler
+        
+    # Похоже на пароль и пользователь ещё не вошёл - отдаём ConversationHandler
+    if is_password(text) and not context.user_data.get("entry"):
+        return None
 
     # Если пользователь уже ввёл пароль и находится в диалоге — не трогаем
     if context.user_data.get("entry"):
