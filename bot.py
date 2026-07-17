@@ -694,7 +694,7 @@ def main():
 
     # 1. Маршрутизатор: перехватывает ВСЕ сообщения ДО диалога зарплат
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, router),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, router, block=False),
     )
 
     # 2. Диалог зарплат (ConversationHandler)
