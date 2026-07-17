@@ -27,7 +27,7 @@ import pandas as pd
 import httpx
 
 # ── Настройка ───────────────────────────────────────────────────
-TELEGRAM_TOKEN = "8511200367:***"
+TELEGRAM_TOKEN = "8511200367:AAEPY0SVgMaXUGy6iMDSWR1COy171-GoaWM"
 
 SHEET_URL = "https://docs.google.com/spreadsheets/d/1kTSGJUmb2AOTovaIDtzC6e-EltiZeeOGV6yJr8FWs-Q/export?format=csv&gid={gid}"
 
