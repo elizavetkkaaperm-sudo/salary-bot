@@ -402,6 +402,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def get_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     pwd = update.message.text.strip()
+    logging.info("get_password вызван с: «%s»", pwd)
+
     try:
         passwords = load_passwords()
     except Exception as e:
