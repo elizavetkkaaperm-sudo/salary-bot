@@ -111,6 +111,10 @@ def classify_question(text: str) -> str:
     if text_lower in ["/start", "start", "/cancel", "cancel"]:
         return "salary"
 
+    # Всё что из одних цифр (4-20 символов) → похоже на пароль → зарплаты
+    if text_lower.isdigit() and 4 <= len(text_lower) <= 20:
+        return "salary"
+
     for kw in SALARY_KEYWORDS:
         if kw in text_lower:
             # Проверяем, что это не ложное срабатывание
